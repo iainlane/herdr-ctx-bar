@@ -1,0 +1,65 @@
+id = "herdr-ctx-bar"
+name = "Context Bar"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "A thin, color-coded context usage bar for Herdr agent sessions"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["python3", "bin/ctx_bar.py", "ensure"]
+
+[[events]]
+on = "pane.created"
+command = ["python3", "bin/ctx_bar.py", "ensure"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["python3", "bin/ctx_bar.py", "ensure"]
+
+[[actions]]
+id = "setup"
+title = "Context Bar: configure the Agent sidebar"
+contexts = ["workspace"]
+command = ["python3", "bin/ctx_bar.py", "setup"]
+
+[[actions]]
+id = "refresh"
+title = "Context Bar: refresh now"
+contexts = ["workspace", "pane"]
+command = ["python3", "bin/ctx_bar.py", "refresh"]
+
+[[actions]]
+id = "status"
+title = "Context Bar: daemon status"
+contexts = ["workspace"]
+command = ["python3", "bin/ctx_bar.py", "status"]
+
+[[actions]]
+id = "restart"
+title = "Context Bar: restart daemon"
+contexts = ["workspace"]
+command = ["python3", "bin/ctx_bar.py", "restart"]
+
+[[actions]]
+id = "demo-green"
+title = "Context Bar: preview green (25%)"
+contexts = ["pane"]
+command = ["python3", "bin/ctx_bar.py", "demo-green"]
+
+[[actions]]
+id = "demo-yellow"
+title = "Context Bar: preview yellow (65%)"
+contexts = ["pane"]
+command = ["python3", "bin/ctx_bar.py", "demo-yellow"]
+
+[[actions]]
+id = "demo-red"
+title = "Context Bar: preview red (95%)"
+contexts = ["pane"]
+command = ["python3", "bin/ctx_bar.py", "demo-red"]
+
+[[actions]]
+id = "demo-clear"
+title = "Context Bar: end preview"
+contexts = ["pane"]
+command = ["python3", "bin/ctx_bar.py", "demo-clear"]
