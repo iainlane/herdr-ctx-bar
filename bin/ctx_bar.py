@@ -8,6 +8,9 @@ the colors; see CONFIG_SNIPPET below.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import suppress
 import fcntl
 import glob
 import hashlib
@@ -23,11 +26,13 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterable, TextIO
+from typing import Any, SupportsFloat, SupportsIndex, TextIO, TypeGuard
+
+import opencode_v2 as opencode
 
 
 SOURCE = "herdr-ctx-bar"
-SUPPORTED_AGENTS = {"codex", "claude", "pi", "hermes"}
+SUPPORTED_AGENTS = {"codex", "claude", "pi", "hermes", "opencode"}
 TOKEN_NAMES = ("ctx_green", "ctx_yellow", "ctx_red")
 ROW_MARGIN = 5
 DEFAULT_SIDEBAR_WIDTH = 26
@@ -36,6 +41,7 @@ MAX_BAR_WIDTH = 80  # Herdr's metadata-token value limit.
 WIDTH_POLL_SECONDS = 2.0
 USAGE_POLL_SECONDS = 15.0
 EVENT_SETTLE_SECONDS = 0.75
+OPENCODE_SAMPLE_SECONDS = 20.0
 TAIL_BYTES = 1024 * 1024
 DEMO_SECONDS = 5 * 60
 DEMO_LEVELS = {
@@ -91,7 +97,9 @@ def render_bar(percent: float, width: int) -> str:
     return "━" * filled + "─" * (width - filled)
 
 
-def finite_positive(value: Any) -> bool:
+def finite_positive(
+    value: Any,
+) -> TypeGuard[str | bytes | bytearray | SupportsFloat | SupportsIndex]:
     try:
         return math.isfinite(float(value)) and float(value) > 0
     except (TypeError, ValueError):
@@ -123,7 +131,9 @@ def json_lines_reverse(path: str | Path) -> Iterable[dict[str, Any]]:
 
 
 def session_info(pane: dict[str, Any]) -> tuple[str, str, str]:
-    session = pane.get("agent_session") or {}
+    session = pane.get("agent_session")
+    if not isinstance(session, dict):
+        session = {}
     agent = str(pane.get("agent") or session.get("agent") or "").lower()
     return agent, str(session.get("kind") or ""), str(session.get("value") or "")
 
@@ -131,10 +141,8 @@ def session_info(pane: dict[str, Any]) -> tuple[str, str, str]:
 def newest(paths: Iterable[str]) -> str | None:
     candidates = []
     for path in paths:
-        try:
+        with suppress(OSError):
             candidates.append((os.path.getmtime(path), path))
-        except OSError:
-            pass
     return max(candidates, default=(0, None))[1]
 
 
@@ -392,7 +400,7 @@ def collect_pi(pane: dict[str, Any]) -> tuple[int, int] | None:
         )
         window = windows.get(f"{provider}/{model}") or windows.get(model)
         if finite_positive(used) and finite_positive(window):
-            return int(float(used)), int(window)
+            return int(float(used)), int(float(window))
     return None
 
 
@@ -481,7 +489,9 @@ def collect_hermes(pane: dict[str, Any]) -> tuple[int, int] | None:
                 reasoning,
                 reasoning_content,
             ) in messages:
-                if finite_positive(token_count):
+                if finite_positive(token_count) and isinstance(
+                    token_count, (int, float, str, bytes)
+                ):
                     used += int(token_count)
                 else:
                     used += sum(
@@ -499,7 +509,12 @@ def collect_hermes(pane: dict[str, Any]) -> tuple[int, int] | None:
     return None
 
 
+def collect_opencode(pane: dict[str, Any]) -> tuple[float, float] | None:
+    return opencode.collect_pane(pane).usage
+
+
 COLLECTORS = {
+    "opencode": collect_opencode,
     "codex": collect_codex,
     "claude": collect_claude,
     "pi": collect_pi,
@@ -533,7 +548,6 @@ def demo_overrides_path() -> Path:
 
 
 def read_demo_overrides(now: float | None = None) -> dict[str, float]:
-    """Return unexpired pane previews as pane_id -> percentage."""
     current_time = time.time() if now is None else now
     try:
         stored = json.loads(demo_overrides_path().read_text())
@@ -547,6 +561,8 @@ def read_demo_overrides(now: float | None = None) -> dict[str, float]:
             continue
         percent = entry.get("percent")
         expires_at = entry.get("expires_at")
+        if percent is None or expires_at is None:
+            continue
         try:
             percent_value = float(percent)
             expires_value = float(expires_at)
@@ -577,7 +593,7 @@ def update_demo_override(
         cleaned = {
             key: {
                 "percent": value,
-                "expires_at": float((stored.get(key) or {}).get("expires_at")),
+                "expires_at": float((stored.get(key) or {}).get("expires_at", 0)),
             }
             for key, value in live.items()
         }
@@ -599,10 +615,8 @@ def update_demo_override(
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
         finally:
-            try:
+            with suppress(FileNotFoundError):
                 os.unlink(temporary)
-            except FileNotFoundError:
-                pass
     finally:
         lock.close()
 
@@ -653,10 +667,8 @@ def install_sidebar_config(path: Path) -> tuple[str, Path | None]:
         os.chmod(temporary, path.stat().st_mode & 0o777 if path.exists() else 0o600)
         os.replace(temporary, path)
     finally:
-        try:
+        with suppress(FileNotFoundError):
             os.unlink(temporary)
-        except FileNotFoundError:
-            pass
     return "installed", backup
 
 
@@ -783,6 +795,64 @@ class HerdrClient:
             sock.close()
 
 
+def opencode_status_path(socket_path: str) -> Path:
+    return lock_path(socket_path).with_suffix(".opencode.json")
+
+
+def print_opencode_status(socket_path: str, *, current_pid: int | None = None) -> None:
+    try:
+        with opencode_status_path(socket_path).open("rb") as handle:
+            raw = handle.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("Diagnostic state exceeds the supported size")
+        state = json.loads(raw)
+        if (
+            not isinstance(state, dict)
+            or state.get("schema") != 1
+            or not isinstance(state.get("panes"), dict)
+        ):
+            raise ValueError("Invalid diagnostic state")
+        for pane_id, entry in state["panes"].items():
+            if not isinstance(pane_id, str) or not isinstance(entry, dict):
+                continue
+            reason = opencode.Reason(entry.get("reason"))
+            checked = entry.get("checked_at")
+            if not isinstance(checked, (int, float)) or not math.isfinite(checked):
+                continue
+            age = max(0, time.time() - checked)
+            pane_label = "".join(
+                char
+                for char in pane_id
+                if char.isascii() and char.isalnum() or char in ":_-"
+            )[:80]
+            stale = (
+                ", stale"
+                if age > OPENCODE_SAMPLE_SECONDS or state.get("pid") != current_pid
+                else ""
+            )
+            print(
+                f"OpenCode {pane_label}: {reason.value} (checked {age:.0f}s ago{stale})"
+            )
+    except (OSError, ValueError, TypeError):
+        print("OpenCode diagnostics: unavailable.")
+
+
+class OpenCodeJob:
+    def __init__(
+        self, future: Future, transport: opencode.Transport, subscribers: dict[str, int]
+    ):
+        self.future = future
+        self.transport = transport
+        self.subscribers = subscribers
+        self.started_at = transport.started_at
+        self.abandoned = False
+
+    def cancel(self) -> None:
+        self.abandoned = True
+        self.transport.cancel()
+        self.future.cancel()
+
+
 class Watcher:
     def __init__(self, socket_path: str):
         self.socket_path = socket_path
@@ -793,6 +863,24 @@ class Watcher:
         self.bar_width = DEFAULT_SIDEBAR_WIDTH - ROW_MARGIN
         self.pending_refresh_at = 0.0
         self.next_usage_poll = 0.0
+        self.opencode_daemon = False
+        self.opencode_executor: ThreadPoolExecutor | None = None
+        self.opencode_jobs: dict[tuple[int, str], OpenCodeJob] = {}
+        self.opencode_pending: dict[str, tuple[float, dict[str, int]]] = {}
+        self.opencode_identities: dict[str, tuple[str, int]] = {}
+        self.opencode_identity_seq = 0
+        self.opencode_due: dict[str, float] = {}
+        self.opencode_samples: dict[str, tuple[opencode.Result, float]] = {}
+        self.opencode_states: dict[str, dict[str, Any]] = {}
+        self.opencode_registration: opencode.Registration | None = None
+        self.opencode_generation = 0
+        self.opencode_cycle = opencode.Cycle()
+        self.opencode_cycle_at = 0.0
+        self.opencode_config_loaded = False
+        self.opencode_file: Path | None = None
+        self.opencode_config_error: opencode.Reason | None = None
+        self.opencode_action_deadline: float | None = None
+        self.opencode_dirty = False
 
     def pane_list(self) -> list[dict[str, Any]]:
         response = self.client.request("pane.list", {}) or {}
@@ -818,24 +906,27 @@ class Watcher:
         self.bar_width = width
         return True
 
-    def publish(self, pane_id: str, percent: float | None) -> None:
-        tokens: dict[str, str | None] = {name: None for name in TOKEN_NAMES}
+    def publish(
+        self, pane_id: str, percent: float | None, *, ttl_ms: int | None = None
+    ) -> None:
+        tokens: dict[str, str | None] = dict.fromkeys(TOKEN_NAMES)
         if percent is not None:
             tokens[color_for_percent(percent)] = render_bar(percent, self.bar_width)
-        self.client.request(
-            "pane.report_metadata",
-            {
-                "pane_id": pane_id,
-                "source": SOURCE,
-                "seq": time.time_ns(),
-                "tokens": tokens,
-            },
-        )
+        params: dict[str, Any] = {
+            "pane_id": pane_id,
+            "source": SOURCE,
+            "seq": time.time_ns(),
+            "tokens": tokens,
+        }
+        if ttl_ms is not None:
+            params["ttl_ms"] = ttl_ms
+        self.client.request("pane.report_metadata", params)
 
     def refresh_usage(self) -> None:
         self.refresh_panes()
         self.refresh_width()
         demo_overrides = read_demo_overrides()
+        self.refresh_opencode(demo_overrides)
         live_supported: set[str] = set()
         for pane_id, pane in self.panes.items():
             agent, _, _ = session_info(pane)
@@ -843,6 +934,12 @@ class Watcher:
                 continue
             live_supported.add(pane_id)
             percent = demo_overrides.get(pane_id)
+            if agent == "opencode" and percent is None:
+                sample = self.opencode_samples.get(pane_id)
+                self.publish_opencode(
+                    pane_id, sample[0] if sample else opencode.Result(), demo_overrides
+                )
+                continue
             if percent is None:
                 percent = collect_percent(pane)
             self.publish(pane_id, percent)
@@ -856,8 +953,322 @@ class Watcher:
         self.next_usage_poll = time.monotonic() + USAGE_POLL_SECONDS
         self.pending_refresh_at = 0.0
 
+    def record_opencode(
+        self,
+        pane_id: str,
+        identifier: str,
+        result: opencode.Result,
+        *,
+        sampled: bool = False,
+    ) -> None:
+        previous = self.opencode_states.get(pane_id, {})
+        used, window = result.usage or (None, None)
+        values = {
+            "session_id": identifier,
+            "reason": result.reason.value,
+            "used": used,
+            "context_window": window,
+        }
+        changed = any(previous.get(key) != value for key, value in values.items())
+        if not changed and not sampled:
+            return
+        now = time.time()
+        reason_changed = (
+            previous.get("reason") != result.reason.value
+            or previous.get("session_id") != identifier
+        )
+        self.opencode_states[pane_id] = {
+            **values,
+            "checked_at": now,
+            "changed_at": now if reason_changed else previous.get("changed_at", now),
+        }
+        self.opencode_dirty = True
+
+    def save_opencode_status(self) -> None:
+        if not self.opencode_daemon or not self.opencode_dirty:
+            return
+        temporary = None
+        try:
+            path = opencode_status_path(self.socket_path)
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=".opencode-", dir=path.parent
+            )
+            with os.fdopen(descriptor, "w") as handle:
+                json.dump(
+                    {"schema": 1, "pid": os.getpid(), "panes": self.opencode_states},
+                    handle,
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            self.opencode_dirty = False
+        except OSError:
+            pass
+        finally:
+            if temporary is not None:
+                with suppress(OSError):
+                    Path(temporary).unlink(missing_ok=True)
+
+    def publish_opencode(
+        self, pane_id: str, result: opencode.Result, demos: dict[str, float]
+    ) -> None:
+        if pane_id in demos:
+            return
+        percent = usage_percent(*result.usage) if result.usage else None
+        if percent is None:
+            self.publish(pane_id, None)
+            self.percentages.pop(pane_id, None)
+        else:
+            sample = self.opencode_samples.get(pane_id)
+            age = time.monotonic() - sample[1] if sample else 0
+            ttl_ms = max(1, int(max(0, OPENCODE_SAMPLE_SECONDS - age) * 1000))
+            self.publish(pane_id, percent, ttl_ms=ttl_ms)
+            self.percentages[pane_id] = percent
+
+    def refresh_opencode(self, demos: dict[str, float]) -> None:
+        now = time.monotonic()
+        live = {}
+        for pane_id, pane in self.panes.items():
+            agent, kind, identifier = session_info(pane)
+            if agent != "opencode":
+                continue
+            reference = pane.get("agent_session")
+            raw_id = reference.get("value") if isinstance(reference, dict) else None
+            identifier = raw_id if kind == "id" and isinstance(raw_id, str) else ""
+            previous = self.opencode_identities.get(pane_id)
+            if previous is None or previous[0] != identifier:
+                self.opencode_identity_seq += 1
+                self.opencode_identities[pane_id] = (
+                    identifier,
+                    self.opencode_identity_seq,
+                )
+                self.opencode_due.pop(pane_id, None)
+                self.opencode_samples.pop(pane_id, None)
+                self.publish_opencode(pane_id, opencode.Result(), demos)
+                self.record_opencode(
+                    pane_id,
+                    identifier,
+                    opencode.Result(reason=opencode.Reason.COLLECTING),
+                )
+            live[pane_id] = self.opencode_identities[pane_id]
+        for pane_id in set(self.opencode_identities) - live.keys():
+            self.opencode_identities.pop(pane_id)
+            self.opencode_due.pop(pane_id, None)
+            self.opencode_samples.pop(pane_id, None)
+            self.opencode_states.pop(pane_id, None)
+            self.publish_opencode(pane_id, opencode.Result(), demos)
+            self.opencode_dirty = True
+        if not live and not self.opencode_jobs:
+            self.opencode_pending.clear()
+            self.save_opencode_status()
+            return
+
+        registration = None
+        failure = None
+        if any(identifier for identifier, _ in live.values()):
+            if not self.opencode_config_loaded:
+                try:
+                    self.opencode_file = opencode.service_file()
+                except opencode.Unavailable as error:
+                    self.opencode_config_error = error.reason
+                self.opencode_config_loaded = True
+            failure = self.opencode_config_error
+            if failure is None and self.opencode_file is not None:
+                try:
+                    registration = opencode.Registration.read(self.opencode_file)
+                except opencode.Unavailable as error:
+                    failure = error.reason
+        if registration != self.opencode_registration:
+            self.opencode_registration = registration
+            self.opencode_generation += 1
+            self.opencode_cycle_at = 0
+            self.opencode_pending.clear()
+            self.opencode_samples.clear()
+            self.opencode_due.clear()
+            for job in self.opencode_jobs.values():
+                job.cancel()
+            for pane_id in live:
+                self.publish_opencode(pane_id, opencode.Result(), demos)
+        if now >= self.opencode_cycle_at:
+            self.opencode_cycle = opencode.Cycle()
+            self.opencode_cycle_at = now + USAGE_POLL_SECONDS
+
+        for key, job in list(self.opencode_jobs.items()):
+            generation, identifier = key
+            interested = any(
+                live.get(pane_id) == (identifier, revision) and pane_id not in demos
+                for pane_id, revision in job.subscribers.items()
+            )
+            if generation != self.opencode_generation or not interested:
+                job.cancel()
+            if not job.future.done():
+                continue
+            del self.opencode_jobs[key]
+            if job.abandoned:
+                continue
+            try:
+                result = job.future.result()
+            except Exception:
+                result = opencode.Result(reason=opencode.Reason.INVALID_RESPONSE)
+            if now - job.started_at >= OPENCODE_SAMPLE_SECONDS:
+                result = opencode.Result(reason=opencode.Reason.EXPIRED)
+            for pane_id, revision in job.subscribers.items():
+                if live.get(pane_id) != (identifier, revision):
+                    continue
+                self.opencode_samples[pane_id] = result, job.started_at
+                self.record_opencode(pane_id, identifier, result, sampled=True)
+                self.publish_opencode(pane_id, result, demos)
+
+        for identifier, (queued, subscribers) in list(self.opencode_pending.items()):
+            subscribers = {
+                pane_id: revision
+                for pane_id, revision in subscribers.items()
+                if live.get(pane_id) == (identifier, revision) and pane_id not in demos
+            }
+            if not subscribers or now - queued >= USAGE_POLL_SECONDS:
+                del self.opencode_pending[identifier]
+                for pane_id in subscribers:
+                    result = opencode.Result(reason=opencode.Reason.BUDGET)
+                    self.opencode_due[pane_id] = now + USAGE_POLL_SECONDS
+                    self.opencode_samples.pop(pane_id, None)
+                    self.record_opencode(pane_id, identifier, result, sampled=True)
+                    self.publish_opencode(pane_id, result, demos)
+                continue
+            self.opencode_pending[identifier] = queued, subscribers
+
+        for pane_id, (identifier, revision) in live.items():
+            sample = self.opencode_samples.get(pane_id)
+            if sample is not None and now - sample[1] >= OPENCODE_SAMPLE_SECONDS:
+                self.opencode_samples.pop(pane_id)
+                expired = opencode.Result(reason=opencode.Reason.EXPIRED)
+                self.record_opencode(pane_id, identifier, expired)
+                self.publish_opencode(pane_id, expired, demos)
+            if not identifier or failure is not None:
+                unavailable = opencode.Result(
+                    reason=opencode.Reason.SESSION
+                    if not identifier
+                    else (failure or opencode.Reason.DISCOVERY)
+                )
+                self.opencode_samples.pop(pane_id, None)
+                self.record_opencode(pane_id, identifier, unavailable)
+                self.publish_opencode(pane_id, unavailable, demos)
+                continue
+            if pane_id in demos or now < self.opencode_due.get(pane_id, 0):
+                continue
+            key = self.opencode_generation, identifier
+            job = self.opencode_jobs.get(key)
+            if job is not None:
+                if not job.abandoned and pane_id not in job.subscribers:
+                    job.subscribers[pane_id] = revision
+                    self.opencode_due[pane_id] = now + USAGE_POLL_SECONDS
+                continue
+            queued, subscribers = self.opencode_pending.setdefault(
+                identifier, (now, {})
+            )
+            subscribers[pane_id] = revision
+
+        while (
+            registration is not None
+            and self.opencode_pending
+            and len(self.opencode_jobs) < 2
+        ):
+            identifier = next(iter(self.opencode_pending))
+            timeout = opencode.COLLECTION_SECONDS
+            if self.opencode_action_deadline is not None:
+                timeout = min(
+                    timeout, max(0, self.opencode_action_deadline - time.monotonic())
+                )
+            if timeout <= 0:
+                break
+            _, subscribers = self.opencode_pending.pop(identifier)
+            if self.opencode_executor is None:
+                self.opencode_executor = ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="ctx-opencode"
+                )
+            transport = opencode.Transport(timeout=timeout)
+            future = self.opencode_executor.submit(
+                opencode.collect,
+                registration,
+                identifier,
+                cycle=self.opencode_cycle,
+                transport=transport,
+            )
+            self.opencode_jobs[self.opencode_generation, identifier] = OpenCodeJob(
+                future, transport, subscribers
+            )
+            for pane_id in subscribers:
+                self.opencode_due[pane_id] = now + USAGE_POLL_SECONDS
+        self.save_opencode_status()
+
+    def close_opencode(self) -> None:
+        for job in self.opencode_jobs.values():
+            job.cancel()
+        self.opencode_jobs.clear()
+        self.opencode_pending.clear()
+        if self.opencode_executor is not None:
+            self.opencode_executor.shutdown(wait=True, cancel_futures=True)
+            self.opencode_executor = None
+
+    def refresh_once(self, timeout: float = opencode.COLLECTION_SECONDS) -> bool:
+        self.opencode_action_deadline = time.monotonic() + timeout
+        try:
+            self.refresh_usage()
+            while (
+                self.opencode_jobs or self.opencode_pending
+            ) and time.monotonic() < self.opencode_action_deadline:
+                futures = [job.future for job in self.opencode_jobs.values()]
+                if futures:
+                    finished, _ = wait(
+                        futures,
+                        timeout=min(
+                            0.05,
+                            max(0, self.opencode_action_deadline - time.monotonic()),
+                        ),
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not finished:
+                        continue
+                self.refresh_panes()
+                self.refresh_opencode(read_demo_overrides())
+            incomplete = bool(self.opencode_jobs or self.opencode_pending)
+            if incomplete:
+                demos = read_demo_overrides()
+                unfinished = {
+                    pane_id
+                    for job in self.opencode_jobs.values()
+                    for pane_id in job.subscribers
+                }
+                unfinished.update(
+                    pane_id
+                    for _, subscribers in self.opencode_pending.values()
+                    for pane_id in subscribers
+                )
+                for pane_id in unfinished:
+                    identity = self.opencode_identities.get(pane_id)
+                    if pane_id in demos or identity is None:
+                        continue
+                    identifier, _ = identity
+                    result = opencode.Result(reason=opencode.Reason.BUDGET)
+                    self.opencode_samples.pop(pane_id, None)
+                    self.record_opencode(pane_id, identifier, result, sampled=True)
+                    self.publish_opencode(pane_id, result, demos)
+            return not incomplete and all(
+                entry["reason"] == opencode.Reason.AVAILABLE.value
+                for pane_id, entry in self.opencode_states.items()
+                if pane_id not in read_demo_overrides()
+            )
+        finally:
+            self.close_opencode()
+
     def rerender(self) -> None:
-        for pane_id, percent in self.percentages.items():
+        demos = read_demo_overrides() if self.opencode_identities else {}
+        for pane_id, percent in list(self.percentages.items()):
+            if pane_id in self.opencode_identities and pane_id not in demos:
+                sample = self.opencode_samples.get(pane_id)
+                self.publish_opencode(
+                    pane_id, sample[0] if sample else opencode.Result(), demos
+                )
+                continue
             self.publish(pane_id, percent)
 
     def schedule_refresh(self) -> None:
@@ -866,10 +1277,21 @@ class Watcher:
             self.pending_refresh_at = deadline
 
     def run(self) -> None:
+        self.opencode_daemon = True
+        try:
+            self.run_subscription()
+        finally:
+            self.close_opencode()
+            if self.subscription is not None:
+                self.subscription.close()
+                self.subscription = None
+
+    def run_subscription(self) -> None:
         self.refresh_usage()
-        self.subscription = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.subscription.connect(self.socket_path)
-        self.subscription.settimeout(WIDTH_POLL_SECONDS)
+        subscription = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.subscription = subscription
+        subscription.connect(self.socket_path)
+        subscription.settimeout(WIDTH_POLL_SECONDS)
         subscriptions = [
             {"type": event}
             for event in (
@@ -886,13 +1308,13 @@ class Watcher:
             "method": "events.subscribe",
             "params": {"subscriptions": subscriptions},
         }
-        self.subscription.sendall((json.dumps(request) + "\n").encode())
+        subscription.sendall((json.dumps(request) + "\n").encode())
         buffer = b""
         while True:
             try:
-                chunk = self.subscription.recv(65536)
+                chunk = subscription.recv(65536)
                 if not chunk:
-                    self.subscription.close()
+                    subscription.close()
                     self.subscription = None
                     return
                 buffer += chunk
@@ -910,17 +1332,18 @@ class Watcher:
                             self.rerender()
                     elif kind:
                         self.schedule_refresh()
-            except socket.timeout:
+            except TimeoutError:
                 pass
             now = time.monotonic()
-            if self.pending_refresh_at and now >= self.pending_refresh_at:
-                self.refresh_usage()
-            elif now >= self.next_usage_poll:
+            if (
+                self.pending_refresh_at and now >= self.pending_refresh_at
+            ) or now >= self.next_usage_poll:
                 self.refresh_usage()
             else:
                 self.refresh_panes()
                 if self.refresh_width():
                     self.rerender()
+            self.refresh_opencode(read_demo_overrides())
 
 
 def socket_path() -> str | None:
@@ -935,10 +1358,8 @@ def run_daemon(path: str) -> int:
     lock_file = acquire_daemon_lock(path)
     if lock_file is None:
         return 0
-    try:
+    with suppress(OSError, KeyboardInterrupt):
         Watcher(path).run()
-    except (OSError, KeyboardInterrupt):
-        pass
     return 0
 
 
@@ -987,10 +1408,12 @@ def run_demo(path: str, command: str) -> int:
         return 2
     update_demo_override(pane_id, percent)
     watcher = Watcher(path)
-    watcher.refresh_usage()
+    complete = watcher.refresh_once()
     ensure(path, quiet=True)
     if percent is None:
-        print(f"Context Bar preview cleared for {pane_id}; live usage restored.")
+        print(
+            f"Context Bar preview cleared for {pane_id}; live refresh {'completed' if complete else 'incomplete'}."
+        )
     else:
         print(
             f"Context Bar preview set to {percent:g}% for {pane_id}; "
@@ -1024,15 +1447,20 @@ def main(argv: list[str]) -> int:
             f"Context Bar daemon: {'running (pid ' + str(pid) + ')' if pid else 'not running'}"
         )
         print(f"Supported agents: {', '.join(sorted(SUPPORTED_AGENTS))}")
+        print_opencode_status(path, current_pid=pid)
         return 0 if pid else 1
     if command == "restart":
         stop(path)
         return ensure(path)
     if command == "refresh":
         watcher = Watcher(path)
-        watcher.refresh_usage()
-        print("Context bars refreshed.")
-        return 0
+        complete = watcher.refresh_once()
+        print(
+            "Context bars refreshed."
+            if complete
+            else "Context bars refreshed; OpenCode collection incomplete."
+        )
+        return 0 if complete else 1
     if command in (*DEMO_LEVELS, "demo-clear"):
         return run_demo(path, command)
     print(f"Unknown command: {command}", file=sys.stderr)

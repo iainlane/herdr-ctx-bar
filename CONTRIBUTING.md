@@ -6,7 +6,7 @@ Before opening a pull request, run:
 
 ```sh
 python3 -m unittest discover -s tests -v
-python3 -m py_compile bin/ctx_bar.py
+python3 -m py_compile bin/ctx_bar.py bin/opencode_v2.py
 ```
 
 When adding or changing an agent collector, include an anonymized fixture-style unit test that covers the relevant session format and compaction behavior.
