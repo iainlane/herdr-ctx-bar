@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
+from dataclasses import asdict, dataclass
+from datetime import date
 import fcntl
 import glob
 import hashlib
@@ -18,6 +20,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import shutil
 import socket
@@ -42,6 +45,7 @@ WIDTH_POLL_SECONDS = 2.0
 USAGE_POLL_SECONDS = 15.0
 EVENT_SETTLE_SECONDS = 0.75
 OPENCODE_SAMPLE_SECONDS = 20.0
+OPENCODE_MIN_HERDR_VERSION = (0, 8, 2)
 TAIL_BYTES = 1024 * 1024
 DEMO_SECONDS = 5 * 60
 DEMO_LEVELS = {
@@ -509,12 +513,7 @@ def collect_hermes(pane: dict[str, Any]) -> tuple[int, int] | None:
     return None
 
 
-def collect_opencode(pane: dict[str, Any]) -> tuple[float, float] | None:
-    return opencode.collect_pane(pane).usage
-
-
 COLLECTORS = {
-    "opencode": collect_opencode,
     "codex": collect_codex,
     "claude": collect_claude,
     "pi": collect_pi,
@@ -795,11 +794,73 @@ class HerdrClient:
             sock.close()
 
 
+@dataclass(frozen=True)
+class HerdrSupport:
+    version: str | None
+    reason: opencode.Reason | None
+
+    @classmethod
+    def from_response(cls, response: object) -> HerdrSupport:
+        unavailable = cls(None, opencode.Reason.HERDR_UNAVAILABLE)
+        if not isinstance(response, dict) or "error" in response:
+            return unavailable
+        result = response.get("result")
+        if not isinstance(result, dict) or result.get("type") != "pong":
+            return unavailable
+        version = result.get("version")
+        if not isinstance(version, str) or len(version) > 128:
+            return unavailable
+        match = re.fullmatch(
+            r"v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?",
+            version,
+        )
+        if match is None:
+            return unavailable
+        release = tuple(int(part) for part in match.groups()[:3])
+        prerelease = match[4]
+        compatible = release > OPENCODE_MIN_HERDR_VERSION or (
+            release == OPENCODE_MIN_HERDR_VERSION and prerelease is None
+        )
+        preview = re.fullmatch(
+            r"preview\.(\d{4}-\d{2}-\d{2})-[0-9a-f]{12}", prerelease or ""
+        )
+        if preview is not None:
+            try:
+                built = date.fromisoformat(preview[1])
+            except ValueError:
+                return unavailable
+            compatible = release >= OPENCODE_MIN_HERDR_VERSION or (
+                release == (0, 8, 0) and built >= date(2026, 8, 17)
+            )
+        return cls(version, None if compatible else opencode.Reason.HERDR_COMPATIBILITY)
+
+    def print_problem(self) -> None:
+        if self.reason is None:
+            return
+        detail = (
+            f"running Herdr {self.version}"
+            if self.version is not None
+            else "cannot verify the running Herdr version"
+        )
+        required = ".".join(str(part) for part in OPENCODE_MIN_HERDR_VERSION)
+        print(
+            f"OpenCode unavailable: {detail}; requires server support from {required} or a compatible preview."
+        )
+        print("Other agent integrations remain enabled.")
+
+
 def opencode_status_path(socket_path: str) -> Path:
     return lock_path(socket_path).with_suffix(".opencode.json")
 
 
-def print_opencode_status(socket_path: str, *, current_pid: int | None = None) -> None:
+def print_opencode_status(
+    socket_path: str,
+    *,
+    current_pid: int | None = None,
+    support: HerdrSupport | None = None,
+) -> None:
+    if support is not None:
+        support.print_problem()
     try:
         with opencode_status_path(socket_path).open("rb") as handle:
             raw = handle.read(1024 * 1024 + 1)
@@ -812,12 +873,24 @@ def print_opencode_status(socket_path: str, *, current_pid: int | None = None) -
             or not isinstance(state.get("panes"), dict)
         ):
             raise ValueError("Invalid diagnostic state")
+        saved_support = state.get("herdr")
+        if support is None and isinstance(saved_support, dict):
+            HerdrSupport.from_response(
+                {"result": {"type": "pong", "version": saved_support.get("version")}}
+            ).print_problem()
         for pane_id, entry in state["panes"].items():
             if not isinstance(pane_id, str) or not isinstance(entry, dict):
                 continue
-            reason = opencode.Reason(entry.get("reason"))
-            checked = entry.get("checked_at")
-            if not isinstance(checked, (int, float)) or not math.isfinite(checked):
+            try:
+                reason = opencode.Reason(entry.get("reason"))
+                checked = entry.get("checked_at")
+                if (
+                    isinstance(checked, bool)
+                    or not isinstance(checked, (int, float))
+                    or not math.isfinite(checked)
+                ):
+                    continue
+            except (ValueError, TypeError, OverflowError):
                 continue
             age = max(0, time.time() - checked)
             pane_label = "".join(
@@ -880,6 +953,8 @@ class Watcher:
         self.opencode_file: Path | None = None
         self.opencode_config_error: opencode.Reason | None = None
         self.opencode_action_deadline: float | None = None
+        self.herdr_support: HerdrSupport | None = None
+        self.next_herdr_probe = 0.0
         self.opencode_dirty = False
 
     def pane_list(self) -> list[dict[str, Any]]:
@@ -908,7 +983,7 @@ class Watcher:
 
     def publish(
         self, pane_id: str, percent: float | None, *, ttl_ms: int | None = None
-    ) -> None:
+    ) -> bool:
         tokens: dict[str, str | None] = dict.fromkeys(TOKEN_NAMES)
         if percent is not None:
             tokens[color_for_percent(percent)] = render_bar(percent, self.bar_width)
@@ -920,7 +995,12 @@ class Watcher:
         }
         if ttl_ms is not None:
             params["ttl_ms"] = ttl_ms
-        self.client.request("pane.report_metadata", params)
+        response = self.client.request("pane.report_metadata", params)
+        return (
+            isinstance(response, dict)
+            and "error" not in response
+            and isinstance(response.get("result"), dict)
+        )
 
     def refresh_usage(self) -> None:
         self.refresh_panes()
@@ -995,7 +1075,14 @@ class Watcher:
             )
             with os.fdopen(descriptor, "w") as handle:
                 json.dump(
-                    {"schema": 1, "pid": os.getpid(), "panes": self.opencode_states},
+                    {
+                        "schema": 1,
+                        "pid": os.getpid(),
+                        "herdr": asdict(self.herdr_support)
+                        if self.herdr_support
+                        else None,
+                        "panes": self.opencode_states,
+                    },
                     handle,
                 )
                 handle.flush()
@@ -1015,15 +1102,42 @@ class Watcher:
         if pane_id in demos:
             return
         percent = usage_percent(*result.usage) if result.usage else None
-        if percent is None:
-            self.publish(pane_id, None)
-            self.percentages.pop(pane_id, None)
-        else:
+        ttl_ms = None
+        if percent is not None:
             sample = self.opencode_samples.get(pane_id)
             age = time.monotonic() - sample[1] if sample else 0
             ttl_ms = max(1, int(max(0, OPENCODE_SAMPLE_SECONDS - age) * 1000))
-            self.publish(pane_id, percent, ttl_ms=ttl_ms)
-            self.percentages[pane_id] = percent
+        if not self.publish(pane_id, percent, ttl_ms=ttl_ms):
+            self.opencode_samples.pop(pane_id, None)
+            self.percentages.pop(pane_id, None)
+            identifier = self.opencode_identities.get(pane_id, ("", 0))[0]
+            self.record_opencode(
+                pane_id, identifier, opencode.Result(reason=opencode.Reason.PUBLICATION)
+            )
+            return
+        if percent is None:
+            self.percentages.pop(pane_id, None)
+            return
+        self.percentages[pane_id] = percent
+
+    def check_herdr_support(self, now: float, *, live: bool) -> None:
+        if self.herdr_support is not None and (not live or now < self.next_herdr_probe):
+            return
+        support = HerdrSupport.from_response(self.client.request("ping", {}))
+        self.next_herdr_probe = now + USAGE_POLL_SECONDS
+        if support == self.herdr_support:
+            return
+        previous = self.herdr_support
+        self.herdr_support = support
+        self.opencode_dirty = True
+        if previous is None or previous.reason == support.reason:
+            return
+        self.opencode_generation += 1
+        self.opencode_samples.clear()
+        self.opencode_pending.clear()
+        self.opencode_due.clear()
+        for job in self.opencode_jobs.values():
+            job.cancel()
 
     def refresh_opencode(self, demos: dict[str, float]) -> None:
         now = time.monotonic()
@@ -1058,6 +1172,20 @@ class Watcher:
             self.opencode_states.pop(pane_id, None)
             self.publish_opencode(pane_id, opencode.Result(), demos)
             self.opencode_dirty = True
+        self.check_herdr_support(now, live=bool(live))
+        if self.herdr_support is not None and self.herdr_support.reason is not None:
+            for key, job in list(self.opencode_jobs.items()):
+                job.cancel()
+                if job.future.done():
+                    del self.opencode_jobs[key]
+            self.opencode_pending.clear()
+            for pane_id, (identifier, _) in live.items():
+                result = opencode.Result(reason=self.herdr_support.reason)
+                self.opencode_samples.pop(pane_id, None)
+                self.record_opencode(pane_id, identifier, result)
+                self.publish_opencode(pane_id, result, demos)
+            self.save_opencode_status()
+            return
         if not live and not self.opencode_jobs:
             self.opencode_pending.clear()
             self.save_opencode_status()
@@ -1252,11 +1380,7 @@ class Watcher:
                     self.opencode_samples.pop(pane_id, None)
                     self.record_opencode(pane_id, identifier, result, sampled=True)
                     self.publish_opencode(pane_id, result, demos)
-            return not incomplete and all(
-                entry["reason"] == opencode.Reason.AVAILABLE.value
-                for pane_id, entry in self.opencode_states.items()
-                if pane_id not in read_demo_overrides()
-            )
+            return not incomplete
         finally:
             self.close_opencode()
 
@@ -1346,6 +1470,32 @@ class Watcher:
             self.refresh_opencode(read_demo_overrides())
 
 
+def print_opencode_refresh(watcher: Watcher) -> bool:
+    demos = read_demo_overrides()
+    states = {
+        pane_id: entry
+        for pane_id, entry in watcher.opencode_states.items()
+        if pane_id not in demos
+    }
+    support = watcher.herdr_support
+    if states and support is not None and support.reason is not None:
+        support.print_problem()
+        return False
+    success = True
+    for pane_id, entry in states.items():
+        reason = opencode.Reason(entry["reason"])
+        if reason == opencode.Reason.AVAILABLE:
+            continue
+        print(f"OpenCode {pane_id}: usage unavailable ({reason.value}).")
+        if reason not in {
+            opencode.Reason.NO_USAGE,
+            opencode.Reason.SESSION,
+            opencode.Reason.MISSING_LIMIT,
+        }:
+            success = False
+    return success
+
+
 def socket_path() -> str | None:
     value = os.environ.get("HERDR_SOCKET_PATH", "").strip()
     return value if value and os.path.exists(value) else None
@@ -1419,6 +1569,7 @@ def run_demo(path: str, command: str) -> int:
             f"Context Bar preview set to {percent:g}% for {pane_id}; "
             f"it expires in {DEMO_SECONDS // 60} minutes."
         )
+    print_opencode_refresh(watcher)
     return 0
 
 
@@ -1447,7 +1598,8 @@ def main(argv: list[str]) -> int:
             f"Context Bar daemon: {'running (pid ' + str(pid) + ')' if pid else 'not running'}"
         )
         print(f"Supported agents: {', '.join(sorted(SUPPORTED_AGENTS))}")
-        print_opencode_status(path, current_pid=pid)
+        support = HerdrSupport.from_response(HerdrClient(path).request("ping", {}))
+        print_opencode_status(path, current_pid=pid, support=support)
         return 0 if pid else 1
     if command == "restart":
         stop(path)
@@ -1460,7 +1612,8 @@ def main(argv: list[str]) -> int:
             if complete
             else "Context bars refreshed; OpenCode collection incomplete."
         )
-        return 0 if complete else 1
+        successful = print_opencode_refresh(watcher)
+        return 0 if complete and successful else 1
     if command in (*DEMO_LEVELS, "demo-clear"):
         return run_demo(path, command)
     print(f"Unknown command: {command}", file=sys.stderr)

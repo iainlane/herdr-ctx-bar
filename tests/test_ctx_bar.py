@@ -326,6 +326,150 @@ class SocketClientTests(SocketTestCase):
         transport.close.assert_called_once_with()
 
 
+class HerdrCompatibilityTests(SocketTestCase):
+    def test_running_server_version_floor(self):
+        reason = ctx_bar.opencode.Reason
+        for version, expected in [
+            ("0.8.0", reason.HERDR_COMPATIBILITY),
+            ("0.8.0-preview.2026-08-04-d78e3d3b5126", reason.HERDR_COMPATIBILITY),
+            ("0.8.0-preview.2026-08-17-1147e60bc0a4", None),
+            ("0.8.0-preview.2026-08-18-9fac51722653", None),
+            ("0.8.2-rc.1", reason.HERDR_COMPATIBILITY),
+            ("0.8.2", None),
+            ("0.8.2+build.123", None),
+            ("0.8.2-preview.2026-08-19-b5c4a0176e91", None),
+            ("0.9.0-preview.2026-09-16-2c29fb29e302", None),
+            ("0.9.1", None),
+            ("0.9.3", None),
+            ("v0.9.5", None),
+            ("0.10.0", None),
+            ("1.0.0-beta.1", None),
+        ]:
+            with self.subTest(version=version):
+                self.assertEqual(
+                    ctx_bar.HerdrSupport.from_response(
+                        {"result": {"type": "pong", "version": version}}
+                    ),
+                    ctx_bar.HerdrSupport(version, expected),
+                )
+        for response in (
+            None,
+            [],
+            {"error": {}},
+            {"result": {"version": "0.9.5"}},
+            {"result": {"type": "pong", "version": "private\ntext"}},
+        ):
+            with self.subTest(response=response):
+                self.assertEqual(
+                    ctx_bar.HerdrSupport.from_response(response),
+                    ctx_bar.HerdrSupport(None, reason.HERDR_UNAVAILABLE),
+                )
+
+    def test_refresh_reports_normal_absence_separately_from_failures(self):
+        reason = ctx_bar.opencode.Reason
+        for result_reason, expected_code, detail in [
+            (reason.AVAILABLE, 0, ""),
+            (
+                reason.NO_USAGE,
+                0,
+                "OpenCode w1:p1: usage unavailable (no_eligible_usage).\n",
+            ),
+            (
+                reason.SESSION,
+                0,
+                "OpenCode w1:p1: usage unavailable (session_unavailable).\n",
+            ),
+            (
+                reason.MISSING_LIMIT,
+                0,
+                "OpenCode w1:p1: usage unavailable (missing_model_limit).\n",
+            ),
+            (
+                reason.AUTHENTICATION,
+                1,
+                "OpenCode w1:p1: usage unavailable (authentication_failed).\n",
+            ),
+            (
+                reason.BUDGET,
+                1,
+                "OpenCode w1:p1: usage unavailable (collection_budget).\n",
+            ),
+        ]:
+            with self.subTest(reason=result_reason):
+                watcher = ctx_bar.Watcher(self.socket_path)
+                watcher.herdr_support = ctx_bar.HerdrSupport("0.9.5", None)
+                watcher.opencode_states = {"w1:p1": {"reason": result_reason.value}}
+                output = io.StringIO()
+                with (
+                    mock.patch.object(
+                        ctx_bar, "socket_path", return_value=self.socket_path
+                    ),
+                    mock.patch.object(ctx_bar, "Watcher", return_value=watcher),
+                    mock.patch.object(watcher, "refresh_usage"),
+                    mock.patch.object(ctx_bar, "read_demo_overrides", return_value={}),
+                    mock.patch.object(sys, "stdout", output),
+                ):
+                    code = ctx_bar.main(["refresh"])
+                self.assertEqual(
+                    (code, output.getvalue()),
+                    (expected_code, "Context bars refreshed.\n" + detail),
+                )
+
+    def test_status_reports_upgrade_even_without_a_diagnostic_file(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                ctx_bar, "state_dir", return_value=Path(self.socket_path).parent
+            ),
+            mock.patch.object(ctx_bar, "socket_path", return_value=self.socket_path),
+            mock.patch.object(ctx_bar, "running_pid", return_value=123),
+            mock.patch.object(
+                ctx_bar.HerdrClient,
+                "request",
+                return_value={"result": {"type": "pong", "version": "0.8.0"}},
+            ) as request,
+            mock.patch.object(sys, "stdout", output),
+        ):
+            code = ctx_bar.main(["status"])
+        request.assert_called_once_with("ping", {})
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "OpenCode unavailable: running Herdr 0.8.0; requires server support from 0.8.2 or a compatible preview.\nOther agent integrations remain enabled.\n",
+            output.getvalue(),
+        )
+
+    def test_status_skips_invalid_entries_without_losing_later_panes(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                ctx_bar, "state_dir", return_value=Path(self.socket_path).parent
+            ),
+            mock.patch.object(ctx_bar.time, "time", return_value=105),
+            mock.patch.object(sys, "stdout", output),
+        ):
+            ctx_bar.opencode_status_path(self.socket_path).write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "pid": 123,
+                        "panes": {
+                            "w1:p1": {
+                                "reason": "unknown_future_reason",
+                                "checked_at": 100,
+                            },
+                            "w1:p2": {"reason": "available", "checked_at": 100},
+                            "w1:p3": {"reason": "available", "checked_at": True},
+                            "w1:p4": {"reason": "available", "checked_at": "bad"},
+                        },
+                    }
+                )
+            )
+            ctx_bar.print_opencode_status(self.socket_path, current_pid=123)
+        self.assertEqual(
+            output.getvalue(), "OpenCode w1:p2: available (checked 5s ago)\n"
+        )
+
+
 class OpenCodeWatcherTests(SocketTestCase):
     def setUp(self):
         super().setUp()
@@ -371,10 +515,221 @@ class OpenCodeWatcherTests(SocketTestCase):
             patch.start()
             self.addCleanup(patch.stop)
         self.watcher = ctx_bar.Watcher(self.socket_path)
+        self.watcher.client.request = mock.Mock(
+            return_value={"result": {"type": "pong", "version": "0.9.5"}}
+        )
         self.addCleanup(self.watcher.close_opencode)
         self.watcher.pane_list = mock.Mock(side_effect=lambda: list(self.panes))
         self.watcher.refresh_width = mock.Mock(return_value=False)
         self.watcher.publish = mock.Mock()
+
+    def test_old_server_disables_only_opencode(self):
+        self.panes.append({"pane_id": "w1:p2", "agent": "codex"})
+        self.watcher.client.request.return_value = {
+            "result": {"type": "pong", "version": "0.8.0"}
+        }
+        self.watcher.refresh_usage()
+        self.assertEqual((self.futures, self.watcher.percentages), ([], {"w1:p2": 25}))
+        self.assertEqual(
+            self.watcher.opencode_states["w1:p1"]["reason"], "incompatible_herdr"
+        )
+        self.opencode.service_file.assert_not_called()
+
+    def test_server_upgrade_is_detected_on_the_next_probe(self):
+        self.watcher.client.request.return_value = {
+            "result": {"type": "pong", "version": "0.8.0"}
+        }
+        with mock.patch.object(ctx_bar.time, "monotonic", return_value=100):
+            self.watcher.refresh_usage()
+            self.watcher.refresh_usage()
+        self.watcher.client.request.assert_called_once_with("ping", {})
+        self.watcher.client.request.return_value = {
+            "result": {"type": "pong", "version": "0.9.4"}
+        }
+        with mock.patch.object(ctx_bar.time, "monotonic", return_value=116):
+            self.watcher.refresh_usage()
+        self.assertEqual(len(self.futures), 1)
+
+    def test_missing_server_version_fails_closed(self):
+        self.watcher.client.request.return_value = None
+        self.watcher.refresh_usage()
+        self.assertEqual(
+            (self.futures, self.watcher.opencode_states["w1:p1"]["reason"]),
+            ([], "herdr_version_unavailable"),
+        )
+
+    def test_publication_failure_is_not_reported_as_available_usage(self):
+        self.watcher.publish = ctx_bar.Watcher.publish.__get__(self.watcher)
+        for result in (
+            self.opencode.Result((50, 100), self.opencode.Reason.AVAILABLE),
+            self.opencode.Result(),
+        ):
+            for response in (
+                None,
+                {},
+                {"error": {"message": "private transport detail"}},
+            ):
+                with self.subTest(result=result, response=response):
+                    self.watcher.opencode_samples["w1:p1"] = result, 100
+                    self.watcher.percentages["w1:p1"] = 50
+                    self.watcher.client.request.return_value = response
+                    with mock.patch.object(ctx_bar.time, "monotonic", return_value=105):
+                        self.watcher.publish_opencode("w1:p1", result, {})
+                    self.assertEqual(
+                        (self.watcher.percentages, self.watcher.opencode_samples),
+                        ({}, {}),
+                    )
+                    self.assertEqual(
+                        self.watcher.opencode_states["w1:p1"]["reason"],
+                        "publication_failed",
+                    )
+                    self.assertNotIn(
+                        "private transport detail",
+                        json.dumps(self.watcher.opencode_states),
+                    )
+
+    def test_subscription_resizes_during_collection_and_handles_fragmented_events(self):
+        self.panes.append({"pane_id": "w1:p2", "agent": "codex"})
+        subscription = mock.Mock()
+        paints = set()
+        steps = iter(
+            [
+                b'{"data":{"type":"layout_up',
+                b'dated"}}\n{"event":"pane.updated"}\n',
+                None,
+                b"",
+            ]
+        )
+
+        def receive(size):
+            chunk = next(steps)
+            if chunk is None:
+                clock.return_value = 101
+                self.futures[0].set_result(
+                    self.opencode.Result((50, 100), self.opencode.Reason.AVAILABLE)
+                )
+                raise TimeoutError
+            return chunk
+
+        def resize():
+            if self.watcher.percentages and self.watcher.bar_width != 30:
+                self.watcher.bar_width = 30
+                return True
+            return False
+
+        def publish(pane_id, percent, **kwargs):
+            if percent is not None:
+                paints.add(
+                    (pane_id, percent, self.watcher.bar_width, self.futures[0].done())
+                )
+            return True
+
+        subscription.recv.side_effect = receive
+        self.watcher.refresh_width.side_effect = resize
+        self.watcher.publish.side_effect = publish
+        with (
+            mock.patch.object(ctx_bar.socket, "socket", return_value=subscription),
+            mock.patch.object(ctx_bar.time, "monotonic", return_value=100) as clock,
+            mock.patch.object(
+                ctx_bar, "state_dir", return_value=Path(self.socket_path).parent
+            ),
+        ):
+            self.watcher.run()
+        self.assertEqual(
+            paints,
+            {
+                ("w1:p2", 25, 21, False),
+                ("w1:p2", 25, 30, False),
+                ("w1:p2", 25, 30, True),
+                ("w1:p1", 50, 30, True),
+            },
+        )
+        self.assertEqual(
+            ctx_bar.collect_percent.call_args_list, [mock.call(self.panes[1])] * 2
+        )
+        self.assertEqual(
+            json.loads(subscription.sendall.call_args.args[0]),
+            {
+                "id": "herdr-ctx-bar:subscribe",
+                "method": "events.subscribe",
+                "params": {
+                    "subscriptions": [
+                        {"type": event}
+                        for event in (
+                            "pane.created",
+                            "pane.closed",
+                            "pane.focused",
+                            "pane.agent_detected",
+                            "pane.updated",
+                            "layout.updated",
+                        )
+                    ]
+                },
+            },
+        )
+        subscription.close.assert_called_once_with()
+        self.executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+
+    def test_subscription_timeout_detects_server_downgrade_before_accepting_results(
+        self,
+    ):
+        self.panes.append({"pane_id": "w1:p2", "agent": "codex"})
+        self.watcher.client.request.side_effect = [
+            {"result": {"type": "pong", "version": "0.9.5"}},
+            {"result": {"type": "pong", "version": "0.8.0"}},
+        ]
+        subscription = mock.Mock()
+
+        def receive(size):
+            subscription.recv.side_effect = None
+            subscription.recv.return_value = b""
+            clock.return_value = 116
+            self.futures[0].set_result(
+                self.opencode.Result((95, 100), self.opencode.Reason.AVAILABLE)
+            )
+            raise TimeoutError
+
+        subscription.recv.side_effect = receive
+        with (
+            mock.patch.object(ctx_bar.socket, "socket", return_value=subscription),
+            mock.patch.object(ctx_bar.time, "monotonic", return_value=100) as clock,
+            mock.patch.object(ctx_bar.time, "time", return_value=105),
+            mock.patch.object(
+                ctx_bar, "state_dir", return_value=Path(self.socket_path).parent
+            ),
+        ):
+            self.watcher.run()
+            state = json.loads(
+                ctx_bar.opencode_status_path(self.socket_path).read_text()
+            )
+        self.assertEqual(self.watcher.percentages, {"w1:p2": 25})
+        self.assertEqual(
+            state,
+            {
+                "schema": 1,
+                "pid": ctx_bar.os.getpid(),
+                "herdr": {"version": "0.8.0", "reason": "incompatible_herdr"},
+                "panes": {
+                    "w1:p1": {
+                        "session_id": "s1",
+                        "reason": "incompatible_herdr",
+                        "used": None,
+                        "context_window": None,
+                        "checked_at": 105,
+                        "changed_at": 105,
+                    }
+                },
+            },
+        )
+        self.assertNotIn(
+            mock.call("w1:p1", 95, ttl_ms=mock.ANY), self.watcher.publish.call_args_list
+        )
+        self.assertEqual(
+            self.watcher.client.request.call_args_list, [mock.call("ping", {})] * 2
+        )
+        self.assertEqual(
+            ctx_bar.collect_percent.call_args_list, [mock.call(self.panes[1])] * 2
+        )
 
     def test_coalesces_requests_and_leaves_other_agents_synchronous(self):
         self.panes.append({"pane_id": "w1:p2", "agent": "codex"})
@@ -552,7 +907,7 @@ class OpenCodeWatcherTests(SocketTestCase):
         self.watcher.opencode_samples["w1:p1"] = result, 100
         self.watcher.opencode_identities["w1:p1"] = "s1", 1
         self.watcher.publish = ctx_bar.Watcher.publish.__get__(self.watcher)
-        self.watcher.client.request = mock.Mock()
+        self.watcher.client.request = mock.Mock(return_value={"result": {}})
         with (
             mock.patch.object(ctx_bar.time, "monotonic", side_effect=(105, 110)),
             mock.patch.object(ctx_bar.time, "time_ns", return_value=123),

@@ -2,6 +2,8 @@
 
 Bug reports and focused pull requests are welcome. Please keep the project true to its purpose: one fast, glanceable context bar with no account, quota, notification, or dashboard features.
 
+The TLS tests require `openssl` on `PATH` to generate temporary certificates.
+
 Before opening a pull request, run:
 
 ```sh

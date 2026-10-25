@@ -5,6 +5,8 @@ import importlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import ssl
+import subprocess
 import sys
 import tempfile
 import threading
@@ -83,7 +85,7 @@ class Fixture:
 
 
 @contextmanager
-def service(fixture):
+def service(fixture, *, tls=None, host="127.0.0.1"):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             status, data = fixture.response(self.path, self.headers)
@@ -112,6 +114,8 @@ def service(fixture):
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
+    if tls is not None:
+        server.socket = tls.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01))
     thread.start()
     with tempfile.TemporaryDirectory() as directory:
@@ -119,7 +123,7 @@ def service(fixture):
         path.write_text(
             json.dumps(
                 {
-                    "url": f"http://127.0.0.1:{server.server_port}",
+                    "url": f"{'https' if tls is not None else 'http'}://{host}:{server.server_port}",
                     "id": "instance-one",
                     "pid": 123,
                     "version": "2.0.32",
@@ -140,6 +144,63 @@ class CollectorTests(unittest.TestCase):
         with service(fixture) as path:
             registration = opencode.Registration.read(path)
             return opencode.collect(registration, "s1", **limits)
+
+    def test_https_verifies_certificate_trust_and_hostname(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cert, key = root / "cert.pem", root / "key.pem"
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-keyout",
+                    str(key),
+                    "-out",
+                    str(cert),
+                    "-days",
+                    "1",
+                    "-subj",
+                    "/CN=localhost",
+                    "-addext",
+                    "subjectAltName=DNS:localhost",
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            tls.load_cert_chain(cert, key)
+            for host, trusted, expected in [
+                (
+                    "localhost",
+                    True,
+                    opencode.Result((9750, 200000), opencode.Reason.AVAILABLE, "a1"),
+                ),
+                ("localhost", False, opencode.Result(reason=opencode.Reason.TRANSPORT)),
+                ("127.0.0.1", True, opencode.Result(reason=opencode.Reason.TRANSPORT)),
+            ]:
+                with self.subTest(host=host, trusted=trusted):
+                    fixture = Fixture()
+                    context = ssl.create_default_context(
+                        cafile=str(cert) if trusted else None
+                    )
+                    with (
+                        mock.patch.object(
+                            ssl, "create_default_context", return_value=context
+                        ),
+                        service(fixture, tls=tls, host=host) as path,
+                    ):
+                        result = opencode.collect(
+                            opencode.Registration.read(path), "s1"
+                        )
+                    self.assertEqual(result, expected)
+                    if expected.reason != opencode.Reason.AVAILABLE:
+                        self.assertEqual(fixture.requests, [])
 
     def test_effective_limit_and_all_token_buckets(self):
         fixture = Fixture()
@@ -409,6 +470,9 @@ class HTTPWatcherTests(unittest.TestCase):
 
     def watcher(self):
         watcher = self.ctx.Watcher("synthetic-herdr-socket")
+        watcher.client.request = mock.Mock(
+            return_value={"result": {"type": "pong", "version": "0.9.5"}}
+        )
         self.addCleanup(watcher.close_opencode)
         watcher.refresh_width = mock.Mock(return_value=False)
         watcher.publish = mock.Mock()

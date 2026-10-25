@@ -35,6 +35,9 @@ class Reason(str, Enum):
     CONFIGURATION = "configuration"
     DISCOVERY = "service_unavailable"
     COMPATIBILITY = "incompatible_service"
+    HERDR_COMPATIBILITY = "incompatible_herdr"
+    HERDR_UNAVAILABLE = "herdr_version_unavailable"
+    PUBLICATION = "publication_failed"
     ENDPOINT = "unsafe_endpoint"
     AUTHENTICATION = "authentication_failed"
     TRANSPORT = "transport_failed"
@@ -584,20 +587,3 @@ def collect(
         return Result(reason=error.reason)
     finally:
         transport.cancel()
-
-
-def collect_pane(pane: dict[str, Any]) -> Result:
-    session = pane.get("agent_session")
-    if not isinstance(session, dict):
-        return Result(reason=Reason.SESSION)
-    if (
-        session.get("kind") != "id"
-        or not isinstance(session.get("value"), str)
-        or not session["value"]
-    ):
-        return Result(reason=Reason.SESSION)
-    try:
-        registration = Registration.read(service_file())
-    except Unavailable as error:
-        return Result(reason=error.reason)
-    return collect(registration, session["value"])

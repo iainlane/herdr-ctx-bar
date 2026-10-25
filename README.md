@@ -30,7 +30,10 @@ That is the whole feature. There are no notifications, provider quotas, or extra
 - Python 3.10 or newer
 - macOS or Linux
 
-OpenCode support additionally requires Herdr 0.9.4 or newer with its current OpenCode integration, and a stable OpenCode 2 release from 2.0.32 onwards. OpenCode 3 is not supported. The baseline for OpenCode compatibility is 2.0.32; required API responses are validated on other 2.x releases.
+OpenCode support additionally requires Herdr's OpenCode integration version 12 or newer, bundled with [Herdr 0.9.1][herdr-opencode-v2], and a stable OpenCode 2 release from 2.0.32 onwards. The first published preview with that integration was [`0.9.0-preview.2026-09-16-2c29fb29e302`][herdr-opencode-v2-preview]. OpenCode 3 is not supported. The baseline for OpenCode compatibility is 2.0.32; required API responses are validated on other 2.x releases.
+
+[herdr-opencode-v2]: https://github.com/herdrdev/herdr/releases/tag/v0.9.1
+[herdr-opencode-v2-preview]: https://github.com/herdrdev/herdr/releases/tag/preview-2026-09-16-2c29fb29e302
 
 ## Installation
 
@@ -101,6 +104,10 @@ If a session or context-window size cannot be identified safely, its bar is hidd
 
 Install or repair Herdr's integration with `herdr integration install opencode`, then restart the OpenCode TUI so the integration can report its root session ID. Context Bar does not install a companion plugin or modify Herdr-managed integration files.
 
+The running Herdr server needs the pane-local session-selection support introduced in [0.8.2][herdr-session-selection], also available in preview `0.8.0-preview.2026-08-17-1147e60bc0a4` and later official previews. This server requirement is separate from the newer integration requirement above. Context Bar checks the running server through `ping`, not the installed CLI version. An incompatible or unverified server disables only OpenCode collection; other agent collectors remain enabled. The check repeats every 15 seconds while OpenCode panes exist.
+
+[herdr-session-selection]: https://github.com/herdrdev/herdr/releases/tag/v0.8.2
+
 Context Bar reads `$XDG_STATE_HOME/opencode/service.json`, or `~/.local/state/opencode/service.json` when `XDG_STATE_HOME` is unset. The watcher uses its own environment, not the environment of each pane. To select a different registration, create `config.json` in the plugin configuration directory specified by `HERDR_PLUGIN_CONFIG_DIR`:
 
 ```json
@@ -115,7 +122,7 @@ Outside Herdr plugin context, the configuration path is `$XDG_CONFIG_HOME/herdr-
 
 The configured service must be the service used by the supported panes. Context Bar requires an exact native session ID and never guesses by directory, title or activity. It measures the root session represented by Herdr's sidebar entry, even when the TUI is browsing a child. Remote services, multiple registrations in one watcher, Mini/headless clients and OpenCode 1 are outside this integration's scope.
 
-Only loopback HTTP(S) endpoints are accepted. Collection ignores HTTP proxy environment variables, rejects redirects and verifies the service PID, version and readiness. The service registration may include a password, which is used only for HTTP Basic authentication as `opencode`. Passwords, message contents, raw service URLs and response bodies are excluded from diagnostics. Context Bar never starts, replaces, stops or migrates an OpenCode service and does not read its SQLite database.
+Only loopback HTTP(S) endpoints are accepted. HTTPS uses the system trust store and requires a valid certificate for the registered host. Collection ignores HTTP proxy environment variables, rejects redirects and verifies the service PID, version and readiness. The service registration may include a password, which is used only for HTTP Basic authentication as `opencode`. Passwords, message contents, raw service URLs and response bodies are excluded from diagnostics. Context Bar never starts, replaces, stops or migrates an OpenCode service and does not read its SQLite database.
 
 OpenCode requests run in a two-worker pool, separately from sidebar resizing and existing agent collectors. Collection starts when a session is identified and repeats every 15 seconds. Requests have a two-second wall-clock limit; each collection has a five-second deadline, ten message pages and an eight-MiB response budget. Cold plugin activation or long reverted histories can exceed these limits and temporarily hide the bar. Previous samples expire after 20 seconds; a failed collection or session change clears the bar. Herdr also expires live OpenCode tokens after the remaining sample lifetime, including when the watcher stops.
 
@@ -147,7 +154,9 @@ herdr plugin log list --plugin herdr-ctx-bar
 
 The bar is intentionally hidden when Context Bar cannot safely identify a session or its context-window size. For bugs, compatibility problems, or feature requests, [open a GitHub issue](https://github.com/pdalinis/herdr-ctx-bar/issues).
 
-For OpenCode, `status` also prints the daemon's latest per-pane availability reason and sample age. Diagnostics are local, socket-scoped snapshots, not a history; they can be stale after a daemon stops. Common reasons include `service_unavailable`, `session_unavailable`, `authentication_failed`, `missing_model_limit`, `no_eligible_usage` and `collection_budget`. A new session or completed compaction may have no eligible usage until the next assistant snapshot. A manual `refresh` waits for bounded OpenCode collection and exits nonzero when usage is unavailable or collection is incomplete; other agents are refreshed before waiting.
+For OpenCode, `status` checks the running server's compatibility and prints the daemon's latest per-pane availability reason and sample age. An incompatible server produces upgrade guidance in `status` and `refresh` output, which is available through Herdr's plugin logs. Diagnostics are local, socket-scoped snapshots, not a history; they can be stale after a daemon stops. Common reasons include `incompatible_herdr`, `herdr_version_unavailable`, `publication_failed`, `service_unavailable`, `session_unavailable`, `authentication_failed`, `missing_model_limit`, `no_eligible_usage` and `collection_budget`.
+
+Context usage may be unavailable after a session starts or compaction completes, until the next assistant snapshot. A manual `refresh` waits for bounded OpenCode collection and reports each unavailable reason. A completed attempt succeeds when the session, eligible usage or model limit is absent. Compatibility, authentication, transport and publication failures, or incomplete collection, produce a nonzero exit status. Other agents are refreshed before waiting.
 
 ## Development
 
